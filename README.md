@@ -66,6 +66,12 @@ request was refused outright, so it cannot double-post), `unavailable` and `inva
 `post` and `delete_post` sign in afresh (`createSession`) every time. The engagement actions below reuse a signed-in session
 for up to 50 minutes, in memory only (see "Sessions"). Images are not resized: shrink them first.
 
+## Workflow Library recipe
+
+**Post to Bluesky when published** (`post-on-publish`): when an entry of the chosen type is published, an editor
+is asked first; once approved, its title (shortened to fit 300 characters) and the entry's link as a card go to Bluesky, and the post's id and link are kept on the entry
+(`bluesky_post_id`, `bluesky_url`).
+
 ## Engagement (social.comments and friends)
 
 Each action declares one capability, so Marvin's shared auto-reply engine and workflows reach it the same way on every

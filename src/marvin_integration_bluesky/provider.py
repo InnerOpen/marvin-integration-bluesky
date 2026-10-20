@@ -27,6 +27,7 @@ from marvin_integration_sdk import (
     ProviderAction,
     Response,
     Retry,
+    WorkflowRecipe,
     register_provider,
 )
 
@@ -172,6 +173,64 @@ class BlueskyProvider(IntegrationProvider):
     category = CATEGORY_DESTINATION
     icon = "🦋"
     guide = "guide.md"
+    # One ready-made workflow in the Workflow Library, offered once Bluesky is connected: post on publish, after an editor
+    # approves. The title (shortened to leave room) and the entry's link, which Bluesky shows as a link card.
+    recipes = (
+        WorkflowRecipe(
+            id="post-on-publish",
+            title="Post to Bluesky when published",
+            outcome=(
+                "When an entry is published, an editor is asked whether to post it; once approved, its title and link go to "
+                "Bluesky (the link as a card), and the post's link is kept on the entry."
+            ),
+            category="Social and community",
+            tags=("bluesky", "social", "publishing", "approval"),
+            definition={
+                "trigger": {"type": "event", "event": "entry_published"},
+                "conditions": [{"field": "entry.entry_type", "op": "eq", "value": "{{entry_type}}"}],
+                "actions": [
+                    {
+                        "kind": "approval",
+                        "id": "ok",
+                        "message": "Post “${entry.title}” to Bluesky with its link?",
+                        "approvers": "editor",
+                        "expires_in_hours": 48,
+                    },
+                    {
+                        "kind": "integration",
+                        "id": "post",
+                        "integration": "{{bluesky_integration}}",
+                        "action": "post",
+                        # Bluesky allows 300 characters, the link included: the title is cut to leave room for it.
+                        "args": {"text": "${entry.title|truncate:200}", "link": "${entry.url}", "dry_run": False},
+                        "when": {"field": "steps.ok.output.decision", "op": "eq", "value": "approved"},
+                    },
+                    {
+                        "kind": "entry",
+                        "op": "set_metadata",
+                        "metadata": {"bluesky_post_id": "${steps.post.output.post_id}", "bluesky_url": "${steps.post.output.url}"},
+                        "when": {"field": "steps.post.output.posted", "op": "eq", "value": True},
+                    },
+                ],
+            },
+            variables={
+                "entry_type": {
+                    "type": "entry_type_slug",
+                    "description": "Entries of this type are offered to Bluesky when published.",
+                    "example": "post",
+                },
+                "bluesky_integration": {
+                    "type": "integration_slug",
+                    "description": "The Bluesky connection (a handle and an app password).",
+                    "example": "bluesky",
+                },
+            },
+            side_effects=(
+                {"kind": "external_post", "description": "One public Bluesky post per approved run."},
+                {"kind": "content_mutation", "description": "Sets bluesky_post_id and bluesky_url on the entry."},
+            ),
+        ),
+    )
 
     credentials = (
         CredentialField(
