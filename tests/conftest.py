@@ -42,6 +42,7 @@ class FakeHttp:
                 }
             ),
             f"{SERVICE}/xrpc/com.atproto.repo.deleteRecord": lambda c: reply(body={}),
+            f"{SERVICE}/xrpc/com.atproto.repo.putRecord": lambda c: reply(body={"uri": "at://x/y/z", "cid": "bafyput"}),
             PIC: reply(headers={"Content-Type": "image/jpeg"}, raw=JPEG),
             PIC2: reply(headers={"content-type": "image/png"}, raw=PNG),
         }
@@ -72,6 +73,16 @@ class FakeHttp:
 
     def to(self, suffix: str) -> list[dict]:
         return [c for c in self.calls if c["url"].split("?")[0].endswith(suffix)]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sessions():
+    """The provider reuses a signed-in session within the process; every test starts without one."""
+    from marvin_integration_bluesky import provider
+
+    provider._SESSIONS.clear()
+    yield
+    provider._SESSIONS.clear()
 
 
 @pytest.fixture

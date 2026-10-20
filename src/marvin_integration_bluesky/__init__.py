@@ -3,4 +3,4 @@
 from .provider import BlueskyProvider
 
 __all__ = ["BlueskyProvider"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

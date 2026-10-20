@@ -7,11 +7,14 @@ and lets the token lapse.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
+import threading
+import time
 from datetime import UTC, datetime
 from typing import ClassVar
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from marvin_integration_sdk import (
     CATEGORY_DESTINATION,
@@ -27,17 +30,44 @@ from marvin_integration_sdk import (
     register_provider,
 )
 
+from .engagement import (
+    BSKY_POST_URL,
+    COMMENT_KINDS,
+    DID,
+    HANDLE,
+    KIND_REPLY,
+    NETWORK,
+    NOTIFICATION_REASONS,
+    RKEY,
+    decode_cursor,
+    encode_cursor,
+    note_key,
+    parse_at_uri,
+    post_url,
+    profile_ref,
+    to_item,
+)
 from .richtext import build_facets, grapheme_count
 
 DEFAULT_SERVICE = "https://bsky.social"
 WEB = "https://bsky.app"
 POST_COLLECTION = "app.bsky.feed.post"
 POST_TYPE = "app.bsky.feed.post"
+THREADGATE_COLLECTION = "app.bsky.feed.threadgate"
+THREADGATE_TYPE = "app.bsky.feed.threadgate"
 
 TEXT_MAX_GRAPHEMES = 300  # lexicon app.bsky.feed.post: text maxGraphemes
 TEXT_MAX_BYTES = 3000  # …and maxLength (UTF-8 bytes)
 MAX_IMAGES = 4  # lexicon app.bsky.embed.images: images maxLength
 IMAGE_MAX_BYTES = 1_000_000  # the PDS's blob limit for post images (lexicon maxSize 1000000)
+DEFAULT_COMMENTS_LIMIT = 50
+MAX_COMMENTS_LIMIT = 200
+NOTIFICATION_PAGE_SIZE = 100  # lexicon app.bsky.notification.listNotifications: limit maximum
+MAX_NOTIFICATION_PAGES = 20
+CHAT_TEXT_MAX_GRAPHEMES = 1000  # lexicon chat.bsky.convo.defs#messageInput: text maxGraphemes (verify)
+CHAT_PROXY = "did:web:api.bsky.chat#bsky_chat"  # the atproto-proxy header that routes chat.bsky.* calls through the PDS (verify)
+HIDDEN_REPLIES_MAX = 300  # lexicon app.bsky.feed.threadgate: hiddenReplies maxLength (verify)
+SESSION_TTL = 3000  # seconds a signed-in session is reused; an access token lives about two hours (verify)
 CARD_TITLE_MAX = 200
 CARD_DESCRIPTION_MAX = 500
 PAGE_READ_BYTES = 262_144  # how much of a linked page is searched for its title
@@ -63,8 +93,20 @@ _ATTR = re.compile(r"""([a-zA-Z:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
+# createSession is rate-limited (about 300 a day per account, verify), and Marvin's engagement engine reads comments every few minutes,
+# so a signed-in session is reused for SESSION_TTL in this process's memory only (never written anywhere). The key holds a digest of
+# the app password, not the password; a changed password or handle simply misses the cache.
+_SESSIONS: dict[tuple[str, str, str], tuple[float, dict]] = {}
+_SESSIONS_LOCK = threading.Lock()
+
+
 def _refusal(message: str) -> IntegrationError:
     return IntegrationError(message, code=CODE_UNSUPPORTED)
+
+
+def _flag(value) -> bool:
+    """A boolean argument; a workflow may pass the string "false"."""
+    return value.strip().lower() in ("1", "true", "yes", "y", "on") if isinstance(value, str) else bool(value)
 
 
 def _sniff_image(data: bytes) -> str | None:
@@ -84,11 +126,49 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+_STR = {"type": "string"}
+_COMMENT_ITEM = {
+    "type": "object",
+    "properties": {
+        "id": {**_STR, "description": "The post's at:// URI: pass it to reply, like, hide and delete_comment."},
+        "kind": {
+            "type": "string",
+            "enum": list(COMMENT_KINDS),
+            "description": "reply: answers one of your posts. mention: a mention, or a quote of your post.",
+        },
+        "post_id": {
+            "type": ["string", "null"],
+            "description": "The post this one replies to (record.reply.parent), or the quoted post; null for a plain mention.",
+        },
+        "post_url": {"type": ["string", "null"], "description": "bsky.app link to that post."},
+        "author": {
+            "type": "object",
+            "properties": {"id": {**_STR, "description": "The author's DID."}, "handle": _STR, "name": {**_STR, "description": "Display name."}},
+        },
+        "text": _STR,
+        "created_at": {**_STR, "description": "ISO 8601, UTC."},
+        "url": {"type": ["string", "null"], "description": "https://bsky.app/profile/<handle>/post/<rkey>"},
+        "network": {"type": "string", "const": NETWORK},
+    },
+}
+_COMMENTS_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "items": {"type": "array", "items": _COMMENT_ITEM, "description": "Oldest first."},
+        "cursor": {**_STR, "description": "Pass as 'since' next time."},
+    },
+    "required": ["items", "cursor"],
+}
+
+
 @register_provider
 class BlueskyProvider(IntegrationProvider):
     slug = "bluesky"
     name = "Bluesky"
-    description = "Post to Bluesky: Marvin's shared social post (text, up to 4 images with alt text, or a link card) straight to the AT Protocol."
+    description = (
+        "Post to Bluesky (text, up to 4 images with alt text, or a link card) straight to the AT Protocol, and read and answer its replies, "
+        "mentions and chat: Marvin's shared social post and engagement capabilities."
+    )
     category = CATEGORY_DESTINATION
     icon = "🦋"
     guide = "guide.md"
@@ -184,6 +264,186 @@ class BlueskyProvider(IntegrationProvider):
             },
             requires_approval=True,
         ),
+        ProviderAction(
+            key="comments",
+            label="Read replies and mentions",
+            description=(
+                "Read the replies to your posts, the posts that mention you and the posts that quote you, from your notifications, as "
+                "normalised items oldest first. A reply under one of your posts is kind 'reply'; a mention is 'mention'; a quote of one of "
+                "your posts is also 'mention' (Bluesky has no separate comments). Pass back the cursor from the last call as 'since' to get "
+                "only what is new."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "since": {
+                        **_STR,
+                        "description": "The cursor this action returned last time (opaque). Omit it on a first run: you get the newest items.",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_COMMENTS_LIMIT, "default": DEFAULT_COMMENTS_LIMIT},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(COMMENT_KINDS)},
+                        "description": "Only these kinds (default: all).",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            capability="social.comments",
+            output_schema=_COMMENTS_OUTPUT,
+            cost_hint="free",
+        ),
+        ProviderAction(
+            key="reply",
+            label="Reply to a reply or mention",
+            description=(
+                "Reply to a reply or mention. Private (the default) is a Bluesky chat message to its author and needs an app password that "
+                "allows access to direct messages; private=false posts a public reply in the thread. A dry run reports what would go out."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "comment_id": {**_STR, "description": "The at:// URI of the post to answer (an item's id from comments)."},
+                    "text": {
+                        **_STR,
+                        "description": f"The reply, as given. Public: up to {TEXT_MAX_GRAPHEMES} characters; chat: up to {CHAT_TEXT_MAX_GRAPHEMES}.",
+                    },
+                    "private": {"type": "boolean", "default": True},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["comment_id", "text"],
+                "additionalProperties": False,
+            },
+            capability="social.reply",
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "replied": {"type": "boolean"},
+                    "reply_id": {"type": ["string", "null"], "description": "Public: the new post's at:// URI. Private: the chat message id."},
+                    "private": {"type": "boolean"},
+                    "url": {"type": ["string", "null"], "description": "Public replies only: the post's bsky.app link."},
+                    "network": {"type": "string", "const": NETWORK},
+                    "would_reply": {"type": "object", "description": "A dry run only: what would be sent."},
+                },
+                "required": ["replied", "network"],
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="like",
+            label="Like a post",
+            description="Like a reply, mention or any post by its at:// URI. Easily undone, so it needs no approval.",
+            input_schema={
+                "type": "object",
+                "properties": {"comment_id": {**_STR, "description": "The at:// URI of the post (an item's id from comments)."}},
+                "required": ["comment_id"],
+                "additionalProperties": False,
+            },
+            capability="social.like",
+            output_schema={"type": "object", "properties": {"liked": {"type": "boolean"}, "network": {"type": "string", "const": NETWORK}}},
+            cost_hint="free",
+        ),
+        ProviderAction(
+            key="repost",
+            label="Repost a post",
+            description="Repost a post to your followers. Public, so a person approves it first.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "post_id": {**_STR, "description": "The post's at:// URI, its bsky.app link, or the record key of one of your own posts."},
+                },
+                "required": ["post_id"],
+                "additionalProperties": False,
+            },
+            capability="social.repost",
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "reposted": {"type": "boolean"},
+                    "url": {"type": ["string", "null"], "description": "The reposted post's bsky.app link."},
+                    "network": {"type": "string", "const": NETWORK},
+                },
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="hide",
+            label="Hide a reply under your post",
+            description=(
+                "Hide (or unhide) a reply in a thread that starts with one of your own posts, by adding it to that post's thread gate's hidden "
+                "replies. Existing reply rules are kept. A thread that isn't yours is refused with code 'unsupported'. Easily undone."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "comment_id": {**_STR, "description": "The at:// URI of the reply."},
+                    "hidden": {"type": "boolean", "default": True, "description": "false shows the reply again."},
+                },
+                "required": ["comment_id"],
+                "additionalProperties": False,
+            },
+            capability="social.hide",
+            output_schema={"type": "object", "properties": {"hidden": {"type": "boolean"}, "network": {"type": "string", "const": NETWORK}}},
+            cost_hint="free",
+        ),
+        ProviderAction(
+            key="delete_comment",
+            label="Delete one of your replies",
+            description=(
+                "Delete one of your own posts (such as a reply) by its at:// URI. Bluesky can't delete other people's replies: that is refused "
+                "with code 'unsupported'. Not undoable, so a person approves it first."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"comment_id": {**_STR, "description": "The at:// URI of your own post."}},
+                "required": ["comment_id"],
+                "additionalProperties": False,
+            },
+            capability="social.delete_comment",
+            output_schema={"type": "object", "properties": {"deleted": {"type": "boolean"}, "network": {"type": "string", "const": NETWORK}}},
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="message",
+            label="Send a chat message",
+            description=(
+                "Send a Bluesky chat (direct) message to an account given by DID or handle. Needs an app password that allows access to direct "
+                "messages, and a recipient who accepts messages from you. A dry run reports what would go out."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "object",
+                        "properties": {
+                            "id": {**_STR, "description": "The account's DID (did:plc:...)."},
+                            "handle": {**_STR, "description": "name.bsky.social or a custom domain, with or without the leading @."},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "text": {**_STR, "description": f"The message, as given (up to {CHAT_TEXT_MAX_GRAPHEMES} characters)."},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["to", "text"],
+                "additionalProperties": False,
+            },
+            capability="social.message",
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "sent": {"type": "boolean"},
+                    "message_id": {"type": ["string", "null"]},
+                    "network": {"type": "string", "const": NETWORK},
+                    "would_send": {"type": "object", "description": "A dry run only: the recipient and text that would go out."},
+                },
+                "required": ["sent", "network"],
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
     )
 
     # ---- plumbing ---------------------------------------------------------------------------
@@ -215,6 +475,12 @@ class BlueskyProvider(IntegrationProvider):
             message = resp.text[:200]
         detail = f"{name}: {message}".strip(": ") or "no detail"
         status = resp.status_code
+        error = BlueskyProvider._fail_for(status, name, detail, resp, what)
+        error.at_error = name  # the AT Protocol error name (RecordNotFound, ExpiredToken...), for callers that handle one specially
+        return error
+
+    @staticmethod
+    def _fail_for(status: int, name: str, detail: str, resp: Response, what: str) -> IntegrationError:
         if status in (401, 403) or name in ("ExpiredToken", "InvalidToken", "AuthenticationRequired", "AccountTakedown"):
             return IntegrationError(f"Bluesky refused {what}: {detail}. Check the handle and app password.", code=CODE_AUTH)
         if status == 429:
@@ -247,8 +513,9 @@ class BlueskyProvider(IntegrationProvider):
         raw: bytes | None = None,
         content_type: str | None = None,
         timeout: float = 15,
+        headers: dict | None = None,
     ) -> dict:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {**({"Authorization": f"Bearer {token}"} if token else {}), **(headers or {})}
         url = f"{self._service(ctx)}/xrpc/{nsid}"
         if raw is not None:
             headers["Content-Type"] = content_type or "application/octet-stream"
@@ -262,14 +529,52 @@ class BlueskyProvider(IntegrationProvider):
         except ValueError as e:
             raise IntegrationError(f"Bluesky sent an unreadable answer during {what}.", code=CODE_UNAVAILABLE) from e
 
+    def _xrpc_get(
+        self, ctx: IntegrationContext, nsid: str, what: str, *, token: str, params: list[tuple[str, str]] | None = None, headers: dict | None = None
+    ) -> dict:
+        query = f"?{urlencode(params)}" if params else ""
+        url = f"{self._service(ctx)}/xrpc/{nsid}{query}"
+        headers = {"Authorization": f"Bearer {token}", **(headers or {})}
+        resp = self._send(ctx, lambda: ctx.http.get(url, headers=headers, timeout=15), what)
+        if not resp.ok:
+            raise self._fail(resp, what)
+        try:
+            return resp.json() if resp.content else {}
+        except ValueError as e:
+            raise IntegrationError(f"Bluesky sent an unreadable answer during {what}.", code=CODE_UNAVAILABLE) from e
+
+    def _session_key(self, ctx: IntegrationContext) -> tuple[str, str, str]:
+        return (self._service(ctx), self._handle(ctx), hashlib.sha256(str(ctx.secret or "").encode()).hexdigest())
+
     def _login(self, ctx: IntegrationContext) -> dict:
-        """A fresh session: ``{"token", "did", "handle"}``. Never persisted; the app password never appears in an error."""
+        """A fresh session: ``{"token", "did", "handle"}``. The app password never appears in an error."""
         if not ctx.secret:
             raise IntegrationError("Missing Bluesky app password.", code=CODE_AUTH)
         data = self._xrpc_post(ctx, "com.atproto.server.createSession", "sign-in", body={"identifier": self._handle(ctx), "password": ctx.secret})
         if not data.get("accessJwt") or not data.get("did"):
             raise IntegrationError("Bluesky signed in but returned no session.", code=CODE_UNAVAILABLE)
-        return {"token": data["accessJwt"], "did": data["did"], "handle": str(data.get("handle") or self._handle(ctx))}
+        session = {"token": data["accessJwt"], "did": data["did"], "handle": str(data.get("handle") or self._handle(ctx))}
+        with _SESSIONS_LOCK:
+            _SESSIONS[self._session_key(ctx)] = (time.monotonic() + SESSION_TTL, session)
+        return session
+
+    def _with_session(self, ctx: IntegrationContext, work):
+        """``work(session)`` with a reused session when one is fresh enough; if Bluesky rejects that session (expired early), sign in
+        again and run it once more. A rejected request wrote nothing, so the second run cannot repeat a write."""
+        if not ctx.secret:
+            raise IntegrationError("Missing Bluesky app password.", code=CODE_AUTH)
+        key = self._session_key(ctx)
+        with _SESSIONS_LOCK:
+            expires, session = _SESSIONS.get(key, (0.0, {}))
+        if session and expires > time.monotonic():
+            try:
+                return work(session)
+            except IntegrationError as e:
+                if e.code != CODE_AUTH:
+                    raise
+                with _SESSIONS_LOCK:
+                    _SESSIONS.pop(key, None)
+        return work(self._login(ctx))
 
     def _resolve_handle(self, ctx: IntegrationContext, handle: str) -> str | None:
         """The DID behind a handle, or None (unknown handle or Bluesky unreachable): a mention is never worth failing a post for."""
@@ -294,7 +599,17 @@ class BlueskyProvider(IntegrationProvider):
         return ("ok", None)
 
     def run_action(self, key: str, args: dict, ctx: IntegrationContext) -> dict:
-        handler = {"post": self._action_post, "delete_post": self._action_delete_post}.get(key)
+        handler = {
+            "post": self._action_post,
+            "delete_post": self._action_delete_post,
+            "comments": self._action_comments,
+            "reply": self._action_reply,
+            "like": self._action_like,
+            "repost": self._action_repost,
+            "hide": self._action_hide,
+            "delete_comment": self._action_delete_comment,
+            "message": self._action_message,
+        }.get(key)
         if handler is None:
             raise NotImplementedError(f"bluesky has no action '{key}'")
         return handler(args or {}, ctx)
@@ -474,3 +789,354 @@ class BlueskyProvider(IntegrationProvider):
             body={"repo": session["did"], "collection": POST_COLLECTION, "rkey": rkey},
         )
         return {"deleted": True, "dry_run": False, "rkey": rkey, "network": "bluesky"}
+
+    # ---- engagement plumbing ----------------------------------------------------------------
+
+    @staticmethod
+    def _required_text(args: dict, key: str, what: str, hint: str) -> str:
+        value = str(args.get(key) or "").strip()
+        if not value:
+            raise _refusal(f"{what} needs '{key}': {hint}.")
+        return value
+
+    def _to_uri(self, ctx: IntegrationContext, raw: str, key: str) -> str:
+        """The at:// URI of the post ``raw`` names: an at:// URI or a bsky.app post link."""
+        if raw.startswith("at://"):
+            ref = parse_at_uri(raw)
+            if not ref or ref[1] != POST_COLLECTION:
+                raise _refusal(f"'{key}' must be the at:// URI of a post (at://did:.../{POST_COLLECTION}/<rkey>), not {raw!r}.")
+            return raw
+        if m := BSKY_POST_URL.match(raw):
+            who, rkey = m.groups()
+            did = who if DID.match(who) else self._resolve_handle(ctx, who)
+            if not did:
+                raise _refusal(f"Couldn't find the Bluesky account @{who} named in '{key}'.")
+            return f"at://{did}/{POST_COLLECTION}/{rkey}"
+        raise _refusal(f"'{key}' must be the at:// URI of a post (an id from comments), not {raw!r}.")
+
+    def _get_post(self, ctx: IntegrationContext, session: dict, uri: str) -> dict:
+        """The post at ``uri`` as the AppView returns it (``app.bsky.feed.getPosts``): its cid, author, record and the viewer's own like/repost."""
+        data = self._xrpc_get(ctx, "app.bsky.feed.getPosts", "looking up the post", token=session["token"], params=[("uris", uri)])
+        posts = data.get("posts") if isinstance(data.get("posts"), list) else []
+        post = next((p for p in posts if isinstance(p, dict) and p.get("uri") == uri and p.get("cid")), None)
+        if post is None:
+            raise _refusal(f"Bluesky has no post at {uri}: it was deleted, or this account can't see it.")
+        return post
+
+    def _create_record(self, ctx: IntegrationContext, session: dict, collection: str, record: dict, what: str, rkey: str | None = None) -> dict:
+        body = {"repo": session["did"], "collection": collection, "record": record}
+        if rkey:
+            body["rkey"] = rkey
+        return self._xrpc_post(ctx, "com.atproto.repo.createRecord", what, token=session["token"], body=body)
+
+    def _chat(
+        self, ctx: IntegrationContext, session: dict, nsid: str, what: str, *, params: list[tuple[str, str]] | None = None, body: dict | None = None
+    ) -> dict:
+        """A ``chat.bsky.*`` call, sent through the PDS to the chat service. Chat refusals are 'unsupported', not 'auth': the sign-in worked."""
+        headers = {"atproto-proxy": CHAT_PROXY}
+        try:
+            if body is None:
+                return self._xrpc_get(ctx, nsid, what, token=session["token"], params=params, headers=headers)
+            return self._xrpc_post(ctx, nsid, what, token=session["token"], body=body, headers=headers)
+        except IntegrationError as e:
+            if e.code == CODE_AUTH and getattr(e, "at_error", "") != "ExpiredToken":
+                raise IntegrationError(
+                    f"Bluesky chat refused {what}: this app password can't use direct messages. Create a new app password with 'Allow access to your "
+                    f"direct messages' ticked (Settings → Privacy and security → App passwords) and paste it into the connection. ({e})",
+                    code=CODE_UNSUPPORTED,
+                ) from e
+            if e.code == CODE_INVALID:
+                raise IntegrationError(
+                    f"Bluesky chat won't take this: the person may not accept messages from this account, or has blocked it. ({e})",
+                    code=CODE_UNSUPPORTED,
+                ) from e
+            raise
+
+    def _send_chat(self, ctx: IntegrationContext, session: dict, did: str, text: str) -> str | None:
+        """Send ``text`` to ``did`` in their chat with this account (opened if needed); the message id."""
+        if did == session["did"]:
+            raise _refusal("That is this account's own post: Bluesky chat can't message yourself.")
+        convo = self._chat(ctx, session, "chat.bsky.convo.getConvoForMembers", "opening the chat", params=[("members", did)]).get("convo")
+        convo_id = str((convo or {}).get("id") or "")
+        if not convo_id:
+            raise IntegrationError("Bluesky opened the chat but returned no conversation id.", code=CODE_UNAVAILABLE)
+        facets, _ = build_facets(text, lambda h: self._resolve_handle(ctx, h))
+        message = {"text": text, **({"facets": facets} if facets else {})}
+        sent = self._chat(ctx, session, "chat.bsky.convo.sendMessage", "sending the chat message", body={"convoId": convo_id, "message": message})
+        return str(sent["id"]) if sent.get("id") else None
+
+    @staticmethod
+    def _check_chat_length(text: str) -> None:
+        n = grapheme_count(text)
+        if n > CHAT_TEXT_MAX_GRAPHEMES:
+            raise _refusal(f"A Bluesky chat message allows {CHAT_TEXT_MAX_GRAPHEMES} characters; this one is {n}. Shorten it.")
+
+    # ---- comments (social.comments) ---------------------------------------------------------
+
+    @staticmethod
+    def _parse_comments(args: dict) -> tuple[tuple | None, int, tuple[str, ...]]:
+        since = args.get("since")
+        boundary = None
+        if since:
+            try:
+                boundary = decode_cursor(str(since))
+            except ValueError as e:
+                raise IntegrationError(str(e), code="invalid_cursor") from e
+        raw = args.get("limit")
+        try:
+            limit = DEFAULT_COMMENTS_LIMIT if raw is None else int(raw)
+        except (TypeError, ValueError):
+            limit = 0
+        if not 1 <= limit <= MAX_COMMENTS_LIMIT:
+            raise _refusal(f"'limit' must be a whole number from 1 to {MAX_COMMENTS_LIMIT} (default {DEFAULT_COMMENTS_LIMIT}).")
+        kinds = COMMENT_KINDS if args.get("kinds") is None else args["kinds"]
+        if not isinstance(kinds, (list, tuple)) or any(k not in COMMENT_KINDS for k in kinds):
+            raise _refusal(f"'kinds' must be a list drawn from {', '.join(COMMENT_KINDS)}.")
+        return boundary, limit, tuple(kinds)
+
+    def _read_notifications(self, ctx: IntegrationContext, session: dict, boundary, limit: int, kinds: tuple[str, ...]):
+        """Reply, mention and quote notifications newer than ``boundary``, as ``(sorted [(key, item)], newest key seen)``.
+
+        listNotifications pages newest first, so it pages back until a page holds something older than the cursor (every newer
+        notification is then in hand); without a cursor it stops once ``limit`` items are in hand, so a first run doesn't replay history."""
+        found: dict[str, tuple[tuple, dict]] = {}
+        newest = None
+        page_cursor = None
+        for _ in range(MAX_NOTIFICATION_PAGES):
+            params = [("limit", str(NOTIFICATION_PAGE_SIZE)), *[("reasons", r) for r in NOTIFICATION_REASONS]]
+            if page_cursor:
+                params.append(("cursor", page_cursor))
+            data = self._xrpc_get(ctx, "app.bsky.notification.listNotifications", "reading notifications", token=session["token"], params=params)
+            notes = data.get("notifications")
+            if not isinstance(notes, list):
+                raise IntegrationError("Bluesky sent an unreadable list of notifications.", code=CODE_UNAVAILABLE)
+            passed = False
+            for note in (n for n in notes if isinstance(n, dict)):
+                key = note_key(note)
+                passed = passed or (boundary is not None and key[0] < boundary[0])
+                if note.get("reason") not in NOTIFICATION_REASONS:  # the server ignored the reasons filter
+                    continue
+                newest = key if newest is None or key > newest else newest
+                if boundary is not None and key <= boundary:
+                    continue
+                item = to_item(note, session["did"], session["handle"])
+                # One post can notify twice (a reply that also mentions us): keep it once, as the more specific 'reply'.
+                if item and item["kind"] in kinds and not (item["id"] in found and found[item["id"]][1]["kind"] == KIND_REPLY):
+                    found[item["id"]] = (key, item)
+            page_cursor = data.get("cursor")
+            if not notes or not page_cursor or passed or (boundary is None and len(found) >= limit):
+                break
+        else:
+            ctx.logger.warning(
+                "bluesky: more than %d new notifications; the rest are picked up on the next poll", MAX_NOTIFICATION_PAGES * NOTIFICATION_PAGE_SIZE
+            )
+        return sorted(found.values(), key=lambda e: e[0]), newest
+
+    def _action_comments(self, args: dict, ctx: IntegrationContext) -> dict:
+        boundary, limit, kinds = self._parse_comments(args)
+        since = str(args.get("since") or "")
+        entries, newest = self._with_session(ctx, lambda session: self._read_notifications(ctx, session, boundary, limit, kinds))
+        if newest is None or (boundary is not None and newest <= boundary):
+            return {"items": [], "cursor": since}
+        if boundary is None:  # no cursor: the newest ``limit``, oldest first
+            kept, cursor = entries[-limit:], newest
+        elif len(entries) > limit:  # more waiting: stop after the last one handed over, the next poll starts there
+            kept = entries[:limit]
+            cursor = kept[-1][0]
+        else:
+            kept, cursor = entries, newest
+        return {"items": [item for _, item in kept], "cursor": encode_cursor(cursor)}
+
+    # ---- reply (social.reply) ---------------------------------------------------------------
+
+    def _action_reply(self, args: dict, ctx: IntegrationContext) -> dict:
+        raw = self._required_text(args, "comment_id", "reply", "the at:// URI of the post to answer")
+        text = self._required_text(args, "text", "reply", "the reply")
+        private = True if args.get("private") is None else _flag(args["private"])
+        dry_run = _flag(args.get("dry_run", False))
+        uri = self._to_uri(ctx, raw, "comment_id")
+        if private:
+            return self._reply_private(ctx, uri, text, dry_run)
+        self._check_length(text)
+        return self._with_session(ctx, lambda session: self._reply_public(ctx, session, uri, text, dry_run))
+
+    def _reply_private(self, ctx: IntegrationContext, uri: str, text: str, dry_run: bool) -> dict:
+        """Chat to the post's author (the DID is the repo of the at:// URI), so a dry run needs no sign-in."""
+        self._check_chat_length(text)
+        did = parse_at_uri(uri)[0]  # type: ignore[index]  # _to_uri returned a valid at:// URI
+        if dry_run:
+            would = {"mode": "chat", "to": did, "about": uri, "text": text, "characters": grapheme_count(text), "via": "chat.bsky.convo.sendMessage"}
+            return {"replied": False, "dry_run": True, "reply_id": None, "private": True, "url": None, "network": NETWORK, "would_reply": would}
+        message_id = self._with_session(ctx, lambda session: self._send_chat(ctx, session, did, text))
+        return {"replied": True, "dry_run": False, "reply_id": message_id, "private": True, "url": None, "network": NETWORK}
+
+    def _reply_public(self, ctx: IntegrationContext, session: dict, uri: str, text: str, dry_run: bool) -> dict:
+        parent = self._get_post(ctx, session, uri)
+        parent_ref = {"uri": parent["uri"], "cid": parent["cid"]}
+        root = ((parent.get("record") or {}).get("reply") or {}).get("root") or {}
+        root_ref = {"uri": root["uri"], "cid": root["cid"]} if root.get("uri") and root.get("cid") else parent_ref  # no reply: it is the root
+        facets, notes = build_facets(text, lambda h: self._resolve_handle(ctx, h))
+        record: dict = {"$type": POST_TYPE, "text": text, "createdAt": _now(), "reply": {"root": root_ref, "parent": parent_ref}}
+        if facets:
+            record["facets"] = facets
+        if dry_run:
+            would = {
+                "mode": "public",
+                "repo": session["handle"],
+                "collection": POST_COLLECTION,
+                "record": record,
+                "characters": grapheme_count(text),
+                "notes": notes,
+            }
+            return {"replied": False, "dry_run": True, "reply_id": None, "private": False, "url": None, "network": NETWORK, "would_reply": would}
+        created = self._create_record(ctx, session, POST_COLLECTION, record, "replying")
+        new_uri = str(created.get("uri") or "")
+        rkey = new_uri.rsplit("/", 1)[-1]
+        if not rkey:
+            raise IntegrationError("Bluesky accepted the reply but returned no record key.", code=CODE_UNAVAILABLE)
+        return {
+            "replied": True,
+            "dry_run": False,
+            "reply_id": new_uri,
+            "private": False,
+            "url": post_url(session["handle"], rkey),
+            "network": NETWORK,
+        }
+
+    # ---- like / repost (social.like, social.repost) -----------------------------------------
+
+    def _action_like(self, args: dict, ctx: IntegrationContext) -> dict:
+        raw = self._required_text(args, "comment_id", "like", "the at:// URI of the post")
+
+        uri = self._to_uri(ctx, raw, "comment_id")
+
+        def work(session: dict) -> dict:
+            post = self._get_post(ctx, session, uri)
+            if not (post.get("viewer") or {}).get("like"):  # already liked: a second like record would be a duplicate
+                subject = {"uri": post["uri"], "cid": post["cid"]}
+                self._create_record(
+                    ctx, session, "app.bsky.feed.like", {"$type": "app.bsky.feed.like", "subject": subject, "createdAt": _now()}, "liking"
+                )
+            return {"liked": True, "network": NETWORK}
+
+        return self._with_session(ctx, work)
+
+    def _action_repost(self, args: dict, ctx: IntegrationContext) -> dict:
+        raw = self._required_text(args, "post_id", "repost", "the post's at:// URI, link or record key")
+
+        own_rkey = RKEY.match(raw) and not raw.startswith(("did:", "at:"))  # a bare record key names one of our own posts
+        uri = None if own_rkey else self._to_uri(ctx, raw, "post_id")
+
+        def work(session: dict) -> dict:
+            post = self._get_post(ctx, session, uri or f"at://{session['did']}/{POST_COLLECTION}/{raw}")
+            if not (post.get("viewer") or {}).get("repost"):
+                subject = {"uri": post["uri"], "cid": post["cid"]}
+                self._create_record(
+                    ctx, session, "app.bsky.feed.repost", {"$type": "app.bsky.feed.repost", "subject": subject, "createdAt": _now()}, "reposting"
+                )
+            rkey = parse_at_uri(post["uri"])[2]  # type: ignore[index]
+            return {"reposted": True, "url": post_url(profile_ref(post.get("author") or {}), rkey), "network": NETWORK}
+
+        return self._with_session(ctx, work)
+
+    # ---- hide (social.hide) -----------------------------------------------------------------
+
+    def _threadgate(self, ctx: IntegrationContext, session: dict, rkey: str) -> dict | None:
+        """The thread gate on the account's own post ``rkey`` (``{uri, cid, value}``), or None when the post has none."""
+        params = [("repo", session["did"]), ("collection", THREADGATE_COLLECTION), ("rkey", rkey)]
+        try:
+            return self._xrpc_get(ctx, "com.atproto.repo.getRecord", "reading the thread gate", token=session["token"], params=params)
+        except IntegrationError as e:
+            if getattr(e, "at_error", "") == "RecordNotFound":
+                return None
+            raise
+
+    def _action_hide(self, args: dict, ctx: IntegrationContext) -> dict:
+        raw = self._required_text(args, "comment_id", "hide", "the at:// URI of the reply")
+        hidden = True if args.get("hidden") is None else _flag(args["hidden"])
+
+        uri = self._to_uri(ctx, raw, "comment_id")
+
+        def work(session: dict) -> dict:
+            root_uri = str((((self._get_post(ctx, session, uri).get("record") or {}).get("reply") or {}).get("root") or {}).get("uri") or "")
+            root = parse_at_uri(root_uri)
+            if root is None:
+                raise _refusal("That post isn't a reply, so there is nothing to hide: Bluesky hides replies in a thread only.")
+            if root[0] != session["did"]:
+                raise _refusal("Bluesky can hide replies only in threads that start with one of your own posts: this thread is someone else's.")
+            return self._set_hidden(ctx, session, uri, root_uri, root[2], hidden)
+
+        return self._with_session(ctx, work)
+
+    def _set_hidden(self, ctx: IntegrationContext, session: dict, uri: str, root_uri: str, root_rkey: str, hidden: bool) -> dict:
+        """Add (or remove) ``uri`` in the root post's thread gate. Its reply rules (``allow``) and everything else in the record are kept; a post
+        with no gate gets one with no ``allow`` at all, which means anyone may reply, as before."""
+        existing = self._threadgate(ctx, session, root_rkey)
+        value = dict(existing["value"]) if existing and isinstance(existing.get("value"), dict) else {"createdAt": _now()}
+        value.update({"$type": THREADGATE_TYPE, "post": root_uri})
+        hidden_replies = [u for u in value.get("hiddenReplies") or [] if isinstance(u, str)]
+        if hidden == (uri in hidden_replies):  # nothing to change
+            return {"hidden": hidden, "network": NETWORK}
+        if hidden:
+            if len(hidden_replies) >= HIDDEN_REPLIES_MAX:
+                raise _refusal(f"Bluesky lets a post hide at most {HIDDEN_REPLIES_MAX} replies, and this one has reached it.")
+            hidden_replies.append(uri)
+        else:
+            hidden_replies.remove(uri)
+        if hidden_replies:
+            value["hiddenReplies"] = hidden_replies
+        else:
+            value.pop("hiddenReplies", None)
+        if existing:
+            body = {"repo": session["did"], "collection": THREADGATE_COLLECTION, "rkey": root_rkey, "record": value}
+            if existing.get("cid"):
+                body["swapRecord"] = existing["cid"]  # fail rather than overwrite a change made meanwhile
+            self._xrpc_post(ctx, "com.atproto.repo.putRecord", "updating the thread gate", token=session["token"], body=body)
+        else:
+            self._create_record(ctx, session, THREADGATE_COLLECTION, value, "creating the thread gate", rkey=root_rkey)
+        return {"hidden": hidden, "network": NETWORK}
+
+    # ---- delete_comment (social.delete_comment) ---------------------------------------------
+
+    def _action_delete_comment(self, args: dict, ctx: IntegrationContext) -> dict:
+        raw = self._required_text(args, "comment_id", "delete_comment", "the at:// URI of your own post")
+        did, _, rkey = parse_at_uri(self._to_uri(ctx, raw, "comment_id"))  # type: ignore[misc]
+
+        def work(session: dict) -> dict:
+            if did != session["did"]:
+                raise _refusal("Bluesky can delete only your own posts: that one belongs to someone else.")
+            body = {"repo": session["did"], "collection": POST_COLLECTION, "rkey": rkey}
+            self._xrpc_post(ctx, "com.atproto.repo.deleteRecord", "deleting the post", token=session["token"], body=body)
+            return {"deleted": True, "network": NETWORK}
+
+        return self._with_session(ctx, work)
+
+    # ---- message (social.message) -----------------------------------------------------------
+
+    def _action_message(self, args: dict, ctx: IntegrationContext) -> dict:
+        to = args.get("to")
+        if not isinstance(to, dict):
+            raise _refusal("message needs 'to': {id} (a DID) or {handle}.")
+        text = self._required_text(args, "text", "message", "the message")
+        dry_run = _flag(args.get("dry_run", False))
+        did = str(to.get("id") or "").strip()
+        handle = str(to.get("handle") or "").strip().removeprefix("@").lower()
+        if did and not DID.match(did):
+            raise _refusal(f"'to.id' must be a Bluesky DID (did:plc:...), not {did!r}; use 'to.handle' for a handle.")
+        if not did and not HANDLE.match(handle):
+            raise _refusal("message needs 'to.id' (a DID) or 'to.handle' (name.bsky.social).")
+        self._check_chat_length(text)
+        if not did:
+            did = self._resolve_handle(ctx, handle) or ""
+        if dry_run:
+            would = {
+                "to": {"id": did or None, "handle": handle or None},
+                "text": text,
+                "characters": grapheme_count(text),
+                "via": "chat.bsky.convo.sendMessage",
+            }
+            return {"sent": False, "dry_run": True, "message_id": None, "network": NETWORK, "would_send": would}
+        if not did:
+            raise _refusal(f"Couldn't find a Bluesky account for @{handle}.")
+        message_id = self._with_session(ctx, lambda session: self._send_chat(ctx, session, did, text))
+        return {"sent": True, "dry_run": False, "message_id": message_id, "network": NETWORK}
