@@ -227,7 +227,7 @@ class BlueskyProvider(IntegrationProvider):
             },
             side_effects=(
                 {"kind": "external_post", "description": "One public Bluesky post per approved run."},
-                {"kind": "content_mutation", "description": "Sets bluesky_post_id and bluesky_url on the entry."},
+                {"kind": "content_mutation", "description": "Saves the post's link on the entry."},
             ),
         ),
     )
