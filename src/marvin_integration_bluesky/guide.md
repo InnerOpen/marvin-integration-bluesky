@@ -24,6 +24,9 @@ them (Marvin's shared **engagement** capabilities). There is no third-party serv
   (default 50), `kinds`. Returns `items` (oldest first) and `cursor`. Each item has `id` (the post's `at://` URI), `kind`, `post_id`
   (the post it answers), `post_url`, `author` (`id` is the DID, `handle`, `name`), `text`, `created_at`, `url` and `network`. A reply
   under your post is kind `reply`; a mention is `mention`, and so is a quote of your post. `comment` is never produced.
+  With `message` in `kinds` it also reads **chat** (direct) messages from other people, merged by time under the same
+  cursor (the 20 most recently active conversations each poll). That needs an app password with direct-message access; without
+  it the comments still come and no messages are read. Marvin's Social inbox keeps them and answers them only by a chat message.
 - **Reply** (`reply`, `social.reply`, needs approval): args `comment_id` (an item's `id`), `text`, `private` (default true), `dry_run`.
   Private is a Bluesky chat message to the person (needs the DM permission above); `private: false` replies publicly in the thread.
   Returns `replied`, `reply_id`, `private`, `url` (public only), `network` and, on a dry run, `would_reply`. The text goes out as

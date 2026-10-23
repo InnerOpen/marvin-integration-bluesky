@@ -819,3 +819,61 @@ def test_the_input_schemas_follow_the_contract():
 def test_an_unknown_action_is_not_implemented(http):
     with pytest.raises(NotImplementedError):
         run("nope", {}, http)
+
+
+# ── direct messages (0.4.0): chat read with the notifications when `message` is asked for ──────────────────────────
+
+CONVOS = f"{SERVICE}/xrpc/chat.bsky.convo.listConvos"
+MESSAGES = f"{SERVICE}/xrpc/chat.bsky.convo.getMessages"
+
+
+def chats(http, messages, *, last=None):
+    """One conversation with Alice; ``messages`` newest first as getMessages returns them."""
+    convo = {"id": "convo1", "members": [{"did": DID, "handle": HANDLE}, {"did": ALICE["did"], "handle": ALICE["handle"], "displayName": "Alice A"}],
+             "lastMessage": {"sentAt": last or (messages[0]["sentAt"] if messages else at(0))}}  # fmt: skip
+    http.routes[CONVOS] = reply(body={"convos": [convo]})
+    http.routes[MESSAGES] = reply(body={"messages": messages})
+
+
+def dm(n, *, sender=None, text=None):
+    return {"id": f"msg{n}", "text": text or f"dm {n}", "sender": {"did": sender or ALICE["did"]}, "sentAt": at(n)}
+
+
+def test_messages_come_with_the_notifications_by_time_and_skip_the_accounts_own(http):
+    feed(http, [note(3, text="great post", parent=MINE)])
+    chats(http, [dm(5, text="Hello there"), dm(4, sender=DID, text="our answer"), dm(2, text="Hi")])
+
+    out = run("comments", {"kinds": ["comment", "reply", "mention", "message"]}, http)
+
+    assert [(i["kind"], i["text"]) for i in out["items"]] == [("message", "Hi"), ("reply", "great post"), ("message", "Hello there")]
+    message = out["items"][-1]
+    assert message["id"] == "convo1/msg5" and message["author"] == {"id": ALICE["did"], "handle": ALICE["handle"], "name": "Alice A"}
+    assert all(c["headers"].get("atproto-proxy") for c in http.calls if "chat.bsky" in c["url"])
+
+
+def test_a_cursor_hands_over_only_newer_messages(http):
+    feed(http, [])
+    chats(http, [dm(5), dm(2)])
+    first = run("comments", {"kinds": ["message"]}, http)
+    chats(http, [dm(7, text="later"), dm(5), dm(2)])
+
+    again = run("comments", {"kinds": ["message"], "since": first["cursor"]}, http)
+
+    assert [i["text"] for i in again["items"]] == ["later"]
+
+
+def test_without_message_asked_for_no_chat_is_read(http):
+    feed(http, [note(3)])
+
+    run("comments", {"kinds": ["reply"]}, http)
+
+    assert http.to("listConvos") == []
+
+
+def test_an_app_password_without_chat_access_still_reads_the_comments(http):
+    feed(http, [note(3, text="great post", parent=MINE)])
+    http.routes[CONVOS] = reply(401, {"error": "AuthMissing", "message": "Bad token scope"})
+
+    out = run("comments", {"kinds": ["reply", "message"]}, http)
+
+    assert [i["kind"] for i in out["items"]] == ["reply"]

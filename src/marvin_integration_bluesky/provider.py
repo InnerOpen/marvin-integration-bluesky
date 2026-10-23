@@ -36,14 +36,17 @@ from .engagement import (
     COMMENT_KINDS,
     DID,
     HANDLE,
+    KIND_MESSAGE,
     KIND_REPLY,
     NETWORK,
     NOTIFICATION_REASONS,
     RKEY,
+    chat_item,
     decode_cursor,
     encode_cursor,
     note_key,
     parse_at_uri,
+    parse_time,
     post_url,
     profile_ref,
     to_item,
@@ -67,6 +70,8 @@ NOTIFICATION_PAGE_SIZE = 100  # lexicon app.bsky.notification.listNotifications:
 MAX_NOTIFICATION_PAGES = 20
 CHAT_TEXT_MAX_GRAPHEMES = 1000  # lexicon chat.bsky.convo.defs#messageInput: text maxGraphemes (verify)
 CHAT_PROXY = "did:web:api.bsky.chat#bsky_chat"  # the atproto-proxy header that routes chat.bsky.* calls through the PDS (verify)
+CHAT_CONVOS_PAGE = 20  # conversations read per poll (newest activity first): a DM in an older one waits until it is active
+CHAT_MESSAGES_PAGE = 30  # messages read back per active conversation
 HIDDEN_REPLIES_MAX = 300  # lexicon app.bsky.feed.threadgate: hiddenReplies maxLength (verify)
 SESSION_TTL = 3000  # seconds a signed-in session is reused; an access token lives about two hours (verify)
 CARD_TITLE_MAX = 200
@@ -991,10 +996,52 @@ class BlueskyProvider(IntegrationProvider):
             )
         return sorted(found.values(), key=lambda e: e[0]), newest
 
+    def _read_chat(self, ctx: IntegrationContext, session: dict, boundary, limit: int):
+        """Chat messages from other people newer than ``boundary``, as ``([(key, item)], newest key)``: the conversations whose last
+        message is new, read back a page each. An app password without direct-message access reads none (the comments still come)."""
+        try:
+            convos = self._chat(ctx, session, "chat.bsky.convo.listConvos", "listing conversations", params=[("limit", str(CHAT_CONVOS_PAGE))])
+        except IntegrationError as e:
+            if e.code != CODE_UNSUPPORTED:
+                raise
+            ctx.logger.info("bluesky: chat not readable with this app password, so no direct messages are read: %s", e)
+            return [], None
+        found: list[tuple[tuple, dict]] = []
+        for convo in (c for c in convos.get("convos") or [] if isinstance(c, dict) and c.get("id")):
+            last = parse_time((convo.get("lastMessage") or {}).get("sentAt"))
+            if last is None or (boundary is not None and last < boundary[0]):
+                continue
+            page = self._chat(
+                ctx,
+                session,
+                "chat.bsky.convo.getMessages",
+                "reading a conversation",
+                params=[("convoId", convo["id"]), ("limit", str(CHAT_MESSAGES_PAGE))],
+            )
+            for message in (m for m in page.get("messages") or [] if isinstance(m, dict)):
+                entry = chat_item(convo, message)
+                if entry is None or entry[1]["author"]["id"] == session["did"]:
+                    continue  # unreadable, or the account's own message
+                if boundary is None or entry[0] > boundary:
+                    found.append(entry)
+        found.sort(key=lambda e: e[0])
+        if boundary is None:
+            found = found[-limit:]
+        return found, (found[-1][0] if found else None)
+
+    def _read_all(self, ctx: IntegrationContext, session: dict, boundary, limit: int, kinds: tuple[str, ...]):
+        """Notifications, and chat messages when ``message`` is asked for, merged by time under one cursor."""
+        entries, newest = self._read_notifications(ctx, session, boundary, limit, kinds)
+        if KIND_MESSAGE in kinds:
+            chats, chat_newest = self._read_chat(ctx, session, boundary, limit)
+            entries = sorted([*entries, *chats], key=lambda e: e[0])
+            newest = max((k for k in (newest, chat_newest) if k is not None), default=None)
+        return entries, newest
+
     def _action_comments(self, args: dict, ctx: IntegrationContext) -> dict:
         boundary, limit, kinds = self._parse_comments(args)
         since = str(args.get("since") or "")
-        entries, newest = self._with_session(ctx, lambda session: self._read_notifications(ctx, session, boundary, limit, kinds))
+        entries, newest = self._with_session(ctx, lambda session: self._read_all(ctx, session, boundary, limit, kinds))
         if newest is None or (boundary is not None and newest <= boundary):
             return {"items": [], "cursor": since}
         if boundary is None:  # no cursor: the newest ``limit``, oldest first

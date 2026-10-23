@@ -13,7 +13,8 @@ NETWORK = "bluesky"
 POST_COLLECTION = "app.bsky.feed.post"
 
 KIND_COMMENT, KIND_REPLY, KIND_MENTION = "comment", "reply", "mention"
-COMMENT_KINDS = (KIND_COMMENT, KIND_REPLY, KIND_MENTION)
+KIND_MESSAGE = "message"  # 0.4.0: a chat (direct) message from someone else
+COMMENT_KINDS = (KIND_COMMENT, KIND_REPLY, KIND_MENTION, KIND_MESSAGE)
 # listNotifications reasons that carry a post worth reading. A quote is reported as a mention (it names the account's post in someone
 # else's post, and there is no fourth kind in the shared contract).
 NOTIFICATION_REASONS = ("reply", "mention", "quote")
@@ -63,6 +64,29 @@ def iso_utc(value) -> str | None:
 
 def note_key(note: dict) -> tuple[datetime, str]:
     return (parse_time(note.get("indexedAt")) or datetime.min.replace(tzinfo=UTC), str(note.get("uri") or ""))
+
+
+def chat_item(convo: dict, message: dict) -> tuple[tuple[datetime, str], dict] | None:
+    """One chat message (``chat.bsky.convo.getMessages``) as ``(key, item)``: kind ``message``, its sender as the author (their
+    handle from the conversation's members). The key sorts with notifications by time; ``chat:`` keeps it apart from a post URI."""
+    sent = parse_time(message.get("sentAt"))
+    sender = str((message.get("sender") or {}).get("did") or "")
+    if sent is None or not message.get("id") or not sender:
+        return None
+    member = next((m for m in convo.get("members") or [] if isinstance(m, dict) and m.get("did") == sender), {})
+    item_id = f"{convo.get('id')}/{message['id']}"
+    item = {
+        "id": item_id,
+        "kind": KIND_MESSAGE,
+        "post_id": None,
+        "post_url": None,
+        "author": {"id": sender, "handle": member.get("handle") or "", "name": member.get("displayName") or member.get("handle") or ""},
+        "text": message.get("text") or "",
+        "created_at": iso_utc(message.get("sentAt")),
+        "url": None,
+        "network": NETWORK,
+    }
+    return (sent, f"chat:{item_id}"), item
 
 
 def encode_cursor(key: tuple[datetime, str]) -> str:
