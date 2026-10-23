@@ -877,3 +877,12 @@ def test_an_app_password_without_chat_access_still_reads_the_comments(http):
     out = run("comments", {"kinds": ["reply", "message"]}, http)
 
     assert [i["kind"] for i in out["items"]] == ["reply"]
+
+
+def test_a_chat_service_that_fails_still_leaves_the_comments(http):
+    feed(http, [note(3, text="great post", parent=MINE)])
+    http.routes[CONVOS] = reply(501, {"error": "MethodNotImplemented", "message": "Method Not Implemented"})
+
+    out = run("comments", {"kinds": ["reply", "message"]}, http)
+
+    assert [i["kind"] for i in out["items"]] == ["reply"]

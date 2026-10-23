@@ -998,14 +998,18 @@ class BlueskyProvider(IntegrationProvider):
 
     def _read_chat(self, ctx: IntegrationContext, session: dict, boundary, limit: int):
         """Chat messages from other people newer than ``boundary``, as ``([(key, item)], newest key)``: the conversations whose last
-        message is new, read back a page each. An app password without direct-message access reads none (the comments still come)."""
+        message is new, read back a page each. Chat is a separate service: when it refuses or fails (an app password without
+        direct-message access, a server that doesn't route chat), no messages are read and the comments still come."""
         try:
-            convos = self._chat(ctx, session, "chat.bsky.convo.listConvos", "listing conversations", params=[("limit", str(CHAT_CONVOS_PAGE))])
+            return self._chat_messages(ctx, session, boundary, limit)
         except IntegrationError as e:
-            if e.code != CODE_UNSUPPORTED:
-                raise
-            ctx.logger.info("bluesky: chat not readable with this app password, so no direct messages are read: %s", e)
+            if getattr(e, "at_error", "") == "ExpiredToken":
+                raise  # the session: _with_session signs in again and retries
+            ctx.logger.info("bluesky: direct messages not read this time (the comments still are): %s", e)
             return [], None
+
+    def _chat_messages(self, ctx: IntegrationContext, session: dict, boundary, limit: int):
+        convos = self._chat(ctx, session, "chat.bsky.convo.listConvos", "listing conversations", params=[("limit", str(CHAT_CONVOS_PAGE))])
         found: list[tuple[tuple, dict]] = []
         for convo in (c for c in convos.get("convos") or [] if isinstance(c, dict) and c.get("id")):
             last = parse_time((convo.get("lastMessage") or {}).get("sentAt"))
