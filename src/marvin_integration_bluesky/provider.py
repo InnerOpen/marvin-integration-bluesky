@@ -69,6 +69,8 @@ MAX_COMMENTS_LIMIT = 200
 NOTIFICATION_PAGE_SIZE = 100  # lexicon app.bsky.notification.listNotifications: limit maximum
 MAX_NOTIFICATION_PAGES = 20
 CHAT_TEXT_MAX_GRAPHEMES = 1000  # lexicon chat.bsky.convo.defs#messageInput: text maxGraphemes (verify)
+PDS_SERVICE_ID = "#atproto_pds"
+"""The DID document's service entry for the account's own server (type ``AtprotoPersonalDataServer``)."""
 CHAT_PROXY = "did:web:api.bsky.chat#bsky_chat"  # the atproto-proxy header that routes chat.bsky.* calls through the PDS (verify)
 CHAT_CONVOS_PAGE = 20  # conversations read per poll (newest activity first): a DM in an older one waits until it is active
 CHAT_MESSAGES_PAGE = 30  # messages read back per active conversation
@@ -165,6 +167,24 @@ _COMMENTS_OUTPUT = {
     },
     "required": ["items", "cursor"],
 }
+
+
+def pds_endpoint(did_doc) -> str | None:
+    """The account's own server (``https://…``, no trailing slash) from a DID document, or None when it names none usable."""
+    services = did_doc.get("service") if isinstance(did_doc, dict) else None
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict) or not str(service.get("id") or "").endswith(PDS_SERVICE_ID):
+            continue
+        endpoint = str(service.get("serviceEndpoint") or "").strip().rstrip("/")
+        parsed = urlparse(endpoint)
+        if parsed.scheme == "https" and parsed.netloc and not parsed.query and not parsed.fragment:
+            return endpoint
+    return None
+
+
+def _auth(session: dict) -> dict:
+    """The keyword arguments a signed-in call takes: the session's token, sent to the account's own server."""
+    return {"token": session["token"], "base": session.get("pds")}
 
 
 @register_provider
@@ -581,9 +601,10 @@ class BlueskyProvider(IntegrationProvider):
         content_type: str | None = None,
         timeout: float = 15,
         headers: dict | None = None,
+        base: str | None = None,
     ) -> dict:
         headers = {**({"Authorization": f"Bearer {token}"} if token else {}), **(headers or {})}
-        url = f"{self._service(ctx)}/xrpc/{nsid}"
+        url = f"{base or self._service(ctx)}/xrpc/{nsid}"
         if raw is not None:
             headers["Content-Type"] = content_type or "application/octet-stream"
             resp = self._send(ctx, lambda: ctx.http.post(url, data=raw, headers=headers, timeout=timeout), what)
@@ -597,10 +618,18 @@ class BlueskyProvider(IntegrationProvider):
             raise IntegrationError(f"Bluesky sent an unreadable answer during {what}.", code=CODE_UNAVAILABLE) from e
 
     def _xrpc_get(
-        self, ctx: IntegrationContext, nsid: str, what: str, *, token: str, params: list[tuple[str, str]] | None = None, headers: dict | None = None
+        self,
+        ctx: IntegrationContext,
+        nsid: str,
+        what: str,
+        *,
+        token: str,
+        params: list[tuple[str, str]] | None = None,
+        headers: dict | None = None,
+        base: str | None = None,
     ) -> dict:
         query = f"?{urlencode(params)}" if params else ""
-        url = f"{self._service(ctx)}/xrpc/{nsid}{query}"
+        url = f"{base or self._service(ctx)}/xrpc/{nsid}{query}"
         headers = {"Authorization": f"Bearer {token}", **(headers or {})}
         resp = self._send(ctx, lambda: ctx.http.get(url, headers=headers, timeout=15), what)
         if not resp.ok:
@@ -614,13 +643,21 @@ class BlueskyProvider(IntegrationProvider):
         return (self._service(ctx), self._handle(ctx), hashlib.sha256(str(ctx.secret or "").encode()).hexdigest())
 
     def _login(self, ctx: IntegrationContext) -> dict:
-        """A fresh session: ``{"token", "did", "handle"}``. The app password never appears in an error."""
+        """A fresh session: ``{"token", "did", "handle", "pds"}``. ``pds`` is the account's own server from the DID document the
+        sign-in returns: every signed-in call goes there (as Bluesky's own apps do), not to the sign-in service — a ``chat.bsky.*``
+        call proxied through the sign-in service is refused (``MethodNotImplemented``). None when the document names no https
+        server: the sign-in service is used. The app password never appears in an error."""
         if not ctx.secret:
             raise IntegrationError("Missing Bluesky app password.", code=CODE_AUTH)
         data = self._xrpc_post(ctx, "com.atproto.server.createSession", "sign-in", body={"identifier": self._handle(ctx), "password": ctx.secret})
         if not data.get("accessJwt") or not data.get("did"):
             raise IntegrationError("Bluesky signed in but returned no session.", code=CODE_UNAVAILABLE)
-        session = {"token": data["accessJwt"], "did": data["did"], "handle": str(data.get("handle") or self._handle(ctx))}
+        session = {
+            "token": data["accessJwt"],
+            "did": data["did"],
+            "handle": str(data.get("handle") or self._handle(ctx)),
+            "pds": pds_endpoint(data.get("didDoc")),
+        }
         with _SESSIONS_LOCK:
             _SESSIONS[self._session_key(ctx)] = (time.monotonic() + SESSION_TTL, session)
         return session
@@ -803,7 +840,7 @@ class BlueskyProvider(IntegrationProvider):
             embedded = []
             for i, ((data, mime), alt) in enumerate(zip(downloaded, alts, strict=True), 1):
                 blob = self._xrpc_post(
-                    ctx, "com.atproto.repo.uploadBlob", f"uploading image {i}", token=session["token"], raw=data, content_type=mime, timeout=60
+                    ctx, "com.atproto.repo.uploadBlob", f"uploading image {i}", **_auth(session), raw=data, content_type=mime, timeout=60
                 ).get("blob")
                 if not blob:
                     raise IntegrationError(f"Bluesky accepted image {i} but returned no blob.", code=CODE_UNAVAILABLE)
@@ -813,7 +850,7 @@ class BlueskyProvider(IntegrationProvider):
             ctx,
             "com.atproto.repo.createRecord",
             "posting",
-            token=session["token"],
+            **_auth(session),
             body={"repo": session["did"], "collection": POST_COLLECTION, "record": record},
         )
         uri = str(created.get("uri") or "")
@@ -852,7 +889,7 @@ class BlueskyProvider(IntegrationProvider):
             ctx,
             "com.atproto.repo.deleteRecord",
             "deleting the post",
-            token=session["token"],
+            **_auth(session),
             body={"repo": session["did"], "collection": POST_COLLECTION, "rkey": rkey},
         )
         return {"deleted": True, "dry_run": False, "rkey": rkey, "network": "bluesky"}
@@ -883,7 +920,7 @@ class BlueskyProvider(IntegrationProvider):
 
     def _get_post(self, ctx: IntegrationContext, session: dict, uri: str) -> dict:
         """The post at ``uri`` as the AppView returns it (``app.bsky.feed.getPosts``): its cid, author, record and the viewer's own like/repost."""
-        data = self._xrpc_get(ctx, "app.bsky.feed.getPosts", "looking up the post", token=session["token"], params=[("uris", uri)])
+        data = self._xrpc_get(ctx, "app.bsky.feed.getPosts", "looking up the post", **_auth(session), params=[("uris", uri)])
         posts = data.get("posts") if isinstance(data.get("posts"), list) else []
         post = next((p for p in posts if isinstance(p, dict) and p.get("uri") == uri and p.get("cid")), None)
         if post is None:
@@ -894,7 +931,7 @@ class BlueskyProvider(IntegrationProvider):
         body = {"repo": session["did"], "collection": collection, "record": record}
         if rkey:
             body["rkey"] = rkey
-        return self._xrpc_post(ctx, "com.atproto.repo.createRecord", what, token=session["token"], body=body)
+        return self._xrpc_post(ctx, "com.atproto.repo.createRecord", what, **_auth(session), body=body)
 
     def _chat(
         self, ctx: IntegrationContext, session: dict, nsid: str, what: str, *, params: list[tuple[str, str]] | None = None, body: dict | None = None
@@ -903,8 +940,8 @@ class BlueskyProvider(IntegrationProvider):
         headers = {"atproto-proxy": CHAT_PROXY}
         try:
             if body is None:
-                return self._xrpc_get(ctx, nsid, what, token=session["token"], params=params, headers=headers)
-            return self._xrpc_post(ctx, nsid, what, token=session["token"], body=body, headers=headers)
+                return self._xrpc_get(ctx, nsid, what, **_auth(session), params=params, headers=headers)
+            return self._xrpc_post(ctx, nsid, what, **_auth(session), body=body, headers=headers)
         except IntegrationError as e:
             if e.code == CODE_AUTH and getattr(e, "at_error", "") != "ExpiredToken":
                 raise IntegrationError(
@@ -973,7 +1010,7 @@ class BlueskyProvider(IntegrationProvider):
             params = [("limit", str(NOTIFICATION_PAGE_SIZE)), *[("reasons", r) for r in NOTIFICATION_REASONS]]
             if page_cursor:
                 params.append(("cursor", page_cursor))
-            data = self._xrpc_get(ctx, "app.bsky.notification.listNotifications", "reading notifications", token=session["token"], params=params)
+            data = self._xrpc_get(ctx, "app.bsky.notification.listNotifications", "reading notifications", **_auth(session), params=params)
             notes = data.get("notifications")
             if not isinstance(notes, list):
                 raise IntegrationError("Bluesky sent an unreadable list of notifications.", code=CODE_UNAVAILABLE)
@@ -1158,7 +1195,7 @@ class BlueskyProvider(IntegrationProvider):
         """The thread gate on the account's own post ``rkey`` (``{uri, cid, value}``), or None when the post has none."""
         params = [("repo", session["did"]), ("collection", THREADGATE_COLLECTION), ("rkey", rkey)]
         try:
-            return self._xrpc_get(ctx, "com.atproto.repo.getRecord", "reading the thread gate", token=session["token"], params=params)
+            return self._xrpc_get(ctx, "com.atproto.repo.getRecord", "reading the thread gate", **_auth(session), params=params)
         except IntegrationError as e:
             if getattr(e, "at_error", "") == "RecordNotFound":
                 return None
@@ -1204,7 +1241,7 @@ class BlueskyProvider(IntegrationProvider):
             body = {"repo": session["did"], "collection": THREADGATE_COLLECTION, "rkey": root_rkey, "record": value}
             if existing.get("cid"):
                 body["swapRecord"] = existing["cid"]  # fail rather than overwrite a change made meanwhile
-            self._xrpc_post(ctx, "com.atproto.repo.putRecord", "updating the thread gate", token=session["token"], body=body)
+            self._xrpc_post(ctx, "com.atproto.repo.putRecord", "updating the thread gate", **_auth(session), body=body)
         else:
             self._create_record(ctx, session, THREADGATE_COLLECTION, value, "creating the thread gate", rkey=root_rkey)
         return {"hidden": hidden, "network": NETWORK}
@@ -1219,7 +1256,7 @@ class BlueskyProvider(IntegrationProvider):
             if did != session["did"]:
                 raise _refusal("Bluesky can delete only your own posts: that one belongs to someone else.")
             body = {"repo": session["did"], "collection": POST_COLLECTION, "rkey": rkey}
-            self._xrpc_post(ctx, "com.atproto.repo.deleteRecord", "deleting the post", token=session["token"], body=body)
+            self._xrpc_post(ctx, "com.atproto.repo.deleteRecord", "deleting the post", **_auth(session), body=body)
             return {"deleted": True, "network": NETWORK}
 
         return self._with_session(ctx, work)

@@ -37,7 +37,8 @@ No changes to Marvin core or its frontend: Marvin discovers the provider through
 | | |
 |---|---|
 | **Credential** | `app_password`: the Bluesky app password (stored by Marvin as the integration's secret; never persisted by the plugin) |
-| **Config** | `handle` (required), `service` (default `https://bsky.social`, must be https) |
+| **Config** | `handle` (required), `service` (default `https://bsky.social`, must be https: where it signs in) |
+| **Where calls go** | Since 0.5.1, after signing in at `service`, every signed-in call goes to the account's own server (the PDS its DID document names, https only), as Bluesky's own apps do. Chat calls proxied through `bsky.social` were refused with `501 MethodNotImplemented`. Without a usable DID document it stays on `service`. |
 | **Health** | `com.atproto.server.createSession` succeeds |
 | **Action** | `post`: capability `social.post`, approval-gated (below) |
 | **Action** | `delete_post`: `{ "rkey", "dry_run"? }` → `{ "deleted", "rkey", "network" }`. Approval-gated; the undo for a mistake. `rkey` is a post's `post_id`; a bsky.app or `at://` link to the post also works |
