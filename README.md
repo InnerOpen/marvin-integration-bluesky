@@ -209,5 +209,6 @@ uv run --extra dev ruff check .
 Tests use a fake `ctx.http` and a made-up password: no network, no credentials. The SDK resolves from the sibling
 `../MarvinIntegrationSDK` checkout (see `[tool.uv.sources]`); released builds take it from the index.
 
-The plugin ships no logo yet: it shows the 🦋 emoji. To add Bluesky's official mark, put it beside `provider.py` as
-`logo.svg` (at most 64 KB) and set `logo = "logo.svg"` on the provider.
+`logo.svg` (since 0.4.2) is Bluesky's butterfly logo in its blue (`#1185fe`), from
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Bluesky_Logo.svg), unaltered. Marvin shows it on the connection's
+card and in Social; the 🦋 emoji is the fallback if Marvin refuses the file.

@@ -177,6 +177,7 @@ class BlueskyProvider(IntegrationProvider):
     )
     category = CATEGORY_DESTINATION
     icon = "🦋"
+    logo = "logo.svg"
     guide = "guide.md"
     # One ready-made workflow in the Workflow Library, offered once Bluesky is connected: post on publish, after an editor
     # approves. The title (shortened to leave room) and the entry's link, which Bluesky shows as a link card.
